@@ -57,6 +57,7 @@ class VMCHandler(
 	private var timeAtLastError: Long = 0
 	private var timeAtLastSend: Long = 0
 	private var anchorHip = false
+	private var mirrorTracking = false
 	private var lastPortIn = 0
 	private var lastPortOut = 0
 	private var lastAddress: InetAddress? = null
@@ -67,80 +68,21 @@ class VMCHandler(
 
 	override fun refreshSettings(refreshRouterSettings: Boolean) {
 		anchorHip = config.anchorHip
+		mirrorTracking = config.mirrorTracking
 
-		// Stops listening and closes OSC port
-		val wasListening = oscReceiver != null && oscReceiver!!.isListening
-		if (wasListening) {
-			oscReceiver!!.stopListening()
-		}
-		val wasConnected = oscSender != null && oscSender!!.isConnected
-		if (wasConnected) {
-			try {
-				oscSender!!.close()
-			} catch (e: IOException) {
-				LogManager.severe("[VMCHandler] Error closing the OSC sender: $e")
-			}
-		}
+		updateOscReceiver(
+			config.portIn,
+			arrayOf(
+				"/VMC/Ext/Bone/Pos",
+				"/VMC/Ext/Hmd/Pos",
+				"/VMC/Ext/Con/Pos",
+				"/VMC/Ext/Tra/Pos",
+				"/VMC/Ext/Root/Pos",
+			),
+		)
+		updateOscSender(config.portOut, config.address)
 
 		if (config.enabled) {
-			// Instantiates the OSC receiver
-			try {
-				val port = config.portIn
-				oscReceiver = OSCPortIn(port)
-				if (lastPortIn != port || !wasListening) {
-					LogManager.info("[VMCHandler] Listening to port $port")
-				}
-				lastPortIn = port
-			} catch (e: IOException) {
-				LogManager
-					.severe(
-						"[VMCHandler] Error listening to the port ${config.portIn}: $e",
-					)
-			}
-
-			// Starts listening for VMC messages
-			if (oscReceiver != null) {
-				val listener = OSCMessageListener { event: OSCMessageEvent -> this.handleReceivedMessage(event) }
-				val listenAddresses = arrayOf(
-					"/VMC/Ext/Bone/Pos",
-					"/VMC/Ext/Hmd/Pos",
-					"/VMC/Ext/Con/Pos",
-					"/VMC/Ext/Tra/Pos",
-					"/VMC/Ext/Root/Pos",
-				)
-
-				for (address in listenAddresses) {
-					oscReceiver!!
-						.dispatcher
-						.addListener(OSCPatternAddressMessageSelector(address), listener)
-				}
-
-				oscReceiver!!.startListening()
-			}
-
-			// Instantiate the OSC sender
-			try {
-				val address = InetAddress.getByName(config.address)
-				val port = config.portOut
-				oscSender = OSCPortOut(InetSocketAddress(address, port))
-				if ((lastPortOut != port && lastAddress !== address) || !wasConnected) {
-					LogManager
-						.info(
-							"[VMCHandler] Sending to port $port at address $address",
-						)
-				}
-				lastPortOut = port
-				lastAddress = address
-
-				oscSender!!.connect()
-				outputUnityArmature = UnityArmature(false)
-			} catch (e: IOException) {
-				LogManager
-					.severe(
-						"[VMCHandler] Error connecting to port ${config.portOut} at the address ${config.address}: $e",
-					)
-			}
-
 			// Load VRM data
 			if (outputUnityArmature != null && config.vrmJson != null) {
 				val vrmReader = VRMReader(config.vrmJson!!)
@@ -172,6 +114,79 @@ class VMCHandler(
 		}
 
 		if (refreshRouterSettings) server.oSCRouter.refreshSettings(false)
+	}
+
+	override fun updateOscReceiver(portIn: Int, args: Array<String>) {
+		// Stops listening and closes OSC port
+		val wasListening = oscReceiver != null && oscReceiver!!.isListening
+		if (wasListening) {
+			oscReceiver!!.stopListening()
+		}
+
+		if (config.enabled) {
+			// Instantiates the OSC receiver
+			try {
+				oscReceiver = OSCPortIn(portIn)
+				if (lastPortIn != portIn || !wasListening) {
+					LogManager.info("[VMCHandler] Listening to port $portIn")
+				}
+				lastPortIn = portIn
+			} catch (e: IOException) {
+				LogManager
+					.severe(
+						"[VMCHandler] Error listening to the port $portIn: $e",
+					)
+			}
+
+			// Starts listening for VMC messages
+			if (oscReceiver != null) {
+				val listener = OSCMessageListener { event: OSCMessageEvent -> this.handleReceivedMessage(event) }
+
+				for (address in args) {
+					oscReceiver!!
+						.dispatcher
+						.addListener(OSCPatternAddressMessageSelector(address), listener)
+				}
+
+				oscReceiver!!.startListening()
+			}
+		}
+	}
+
+	override fun updateOscSender(portOut: Int, ip: String) {
+		// Stop sending
+		val wasConnected = oscSender != null && oscSender!!.isConnected
+		if (wasConnected) {
+			try {
+				oscSender!!.close()
+			} catch (e: IOException) {
+				LogManager.severe("[VMCHandler] Error closing the OSC sender: $e")
+			}
+		}
+
+		if (config.enabled) {
+			// Instantiate the OSC sender
+			try {
+				val addr = InetAddress.getByName(ip)
+				oscSender = OSCPortOut(InetSocketAddress(addr, portOut))
+				if ((lastPortOut != portOut && lastAddress != addr) || !wasConnected) {
+					LogManager
+						.info(
+							"[VMCHandler] Sending to port $portOut at address $ip",
+						)
+				}
+				lastPortOut = portOut
+				lastAddress = addr
+
+				oscSender!!.connect()
+				outputUnityArmature = UnityArmature(false)
+			} catch (e: IOException) {
+				LogManager
+					.severe(
+						"[VMCHandler] Error connecting to port $portOut at the address $ip: $e",
+					)
+			}
+		}
 	}
 
 	private fun handleReceivedMessage(event: OSCMessageEvent) {
@@ -330,23 +345,30 @@ class VMCHandler(
 					oscBundle.addPacket(OSCMessage("/VMC/Ext/Root/Pos", oscArgs.clone()))
 
 					for (unityBone in UnityBone.entries) {
-						val boneType = unityBone.boneType ?: continue
+						// Get opposite bone if tracking must be mirrored
+						val boneType = (if (mirrorTracking) UnityBone.tryGetOppositeArmBone(unityBone) else unityBone).boneType
+
+						if (boneType == null) continue
+
 						// Get SlimeVR bone
 						val bone = humanPoseManager.getBone(boneType)
 
 						// Update unity hierarchy from bone's global rotation
-						outputUnityArmature
-							?.setGlobalRotationForBone(
-								unityBone,
-								bone.getGlobalRotation() * bone.rotationOffset.inv(),
-							)
+						val boneRotation = if (mirrorTracking) {
+							// Mirror tracking horizontally
+							val rotBuf = bone.getGlobalRotation() * bone.rotationOffset.inv()
+							Quaternion(rotBuf.w, rotBuf.x, -rotBuf.y, -rotBuf.z)
+						} else {
+							bone.getGlobalRotation() * bone.rotationOffset.inv()
+						}
+						outputUnityArmature?.setGlobalRotationForBone(unityBone, boneRotation)
 					}
 
 					if (!anchorHip) {
 						// Anchor from head
 						outputUnityArmature?.let { unityArmature ->
 							// Scale the SlimeVR head position with the VRM model
-							val slimevrScaledHeadPos = humanPoseManager.getBone(BoneType.HEAD).getPosition() *
+							val slimevrScaledHeadPos = humanPoseManager.getBone(BoneType.HEAD).getTailPosition() *
 								(vrmHeight / humanPoseManager.userHeightFromConfig)
 
 							// Get the VRM head and hip positions
@@ -362,32 +384,29 @@ class VMCHandler(
 					}
 
 					// Update Unity skeleton
-					outputUnityArmature!!.update()
+					outputUnityArmature?.update()
 
 					// Add Unity humanoid bones transforms
-					for (bone in UnityBone.entries) {
-						if (bone.boneType != null && !(
-								humanPoseManager.isTrackingLeftArmFromController &&
-									isLeftArmUnityBone(bone)
-								) &&
-							!(
-								humanPoseManager.isTrackingRightArmFromController &&
-									isRightArmUnityBone(bone)
-								)
+					for (unityBone in UnityBone.entries) {
+						// Don't send bones for which we don't have an equivalent
+						// Don't send fingers if we don't have any tracker for them
+						// Don't send arm bones if we're tracking from the controller
+						if (unityBone.boneType != null &&
+							(!UnityBone.isLeftFingerBone(unityBone) || humanPoseManager.skeleton.hasLeftFingerTracker || (mirrorTracking && humanPoseManager.skeleton.hasRightFingerTracker)) &&
+							(!UnityBone.isRightFingerBone(unityBone) || humanPoseManager.skeleton.hasRightFingerTracker || (mirrorTracking && humanPoseManager.skeleton.hasLeftFingerTracker)) &&
+							!(humanPoseManager.isTrackingLeftArmFromController && (UnityBone.isLeftArmBone(unityBone) || unityBone == UnityBone.LEFT_SHOULDER)) &&
+							!(humanPoseManager.isTrackingRightArmFromController && (UnityBone.isRightArmBone(unityBone) || unityBone == UnityBone.RIGHT_SHOULDER))
 						) {
 							oscArgs.clear()
-							oscArgs.add(bone.stringVal)
-							addTransformToArgs(
-								outputUnityArmature!!.getLocalTranslationForBone(bone),
-								outputUnityArmature!!.getLocalRotationForBone(bone),
-							)
-							oscBundle
-								.addPacket(
-									OSCMessage(
-										"/VMC/Ext/Bone/Pos",
-										oscArgs.clone(),
-									),
+							oscArgs.add(unityBone.stringVal)
+							outputUnityArmature?.let {
+								addTransformToArgs(
+									it.getLocalTranslationForBone(unityBone),
+									it.getLocalRotationForBone(unityBone),
 								)
+							}
+
+							oscBundle.addPacket(OSCMessage("/VMC/Ext/Bone/Pos", oscArgs.clone()))
 						}
 					}
 				}
@@ -479,10 +498,6 @@ class VMCHandler(
 		oscArgs.add(-rot.z)
 		oscArgs.add(-rot.w)
 	}
-
-	private fun isLeftArmUnityBone(bone: UnityBone): Boolean = bone == UnityBone.LEFT_UPPER_ARM || bone == UnityBone.LEFT_LOWER_ARM || bone == UnityBone.LEFT_HAND
-
-	private fun isRightArmUnityBone(bone: UnityBone): Boolean = bone == UnityBone.RIGHT_UPPER_ARM || bone == UnityBone.RIGHT_LOWER_ARM || bone == UnityBone.RIGHT_HAND
 
 	override fun getOscSender(): OSCPortOut = oscSender!!
 
