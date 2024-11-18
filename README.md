@@ -64,3 +64,5 @@ okay with this and that you are authorized to provide the above licenses.
 
 [LICENSE-MIT]: LICENSE-MIT
 [LICENSE-APACHE]: LICENSE-APACHE
+
+---
